@@ -1,25 +1,25 @@
-from pathlib import Path
-import h5py
 import numpy as np
 import torch
 
 
-def load_frame(root, episode, frame, shapes, bmin, bmax, device):
-    result = {}
-    with h5py.File(Path(root) / f"episode_{episode}.h5", "r") as f:
-        if not np.allclose(f.attrs["bounds"], torch.stack((bmin, bmax)).detach().cpu().numpy()):
-            raise ValueError("Robot label cache bounds do not match VAE bounds")
-        for kind in ("robot", "gripper"):
-            grids = []
-            by_shape = {tuple(f[f"{kind}/{lv}"].attrs["shape"]): lv for lv in f[kind]}
-            for level, xyz in enumerate(shapes):
-                zyx = tuple(reversed(xyz))
-                if zyx not in by_shape:
-                    raise ValueError(f"Robot label cache resolution does not match VAE: need {zyx}, cache has {list(by_shape)}")
-                d = f[f"{kind}/{by_shape[zyx]}"]
-                mask = np.unpackbits(d[frame], count=int(np.prod(zyx))).reshape(zyx).copy()
-                grids.append(torch.from_numpy(mask).to(device=device, dtype=torch.bool)[None, None])
-            result[kind] = grids
+def load_frame(f, frame, shapes, bmin, bmax, device):
+    """Robot and gripper voxel labels of one frame from the ``labels`` group of an open packed episode."""
+    if "labels" not in f:
+        raise KeyError(f"{f.filename} has no robot labels: run scripts/consolidate_packed.py, or train with --recipe minimal")
+    result, f = {}, f["labels"]
+    if not np.allclose(f.attrs["bounds"], torch.stack((bmin, bmax)).detach().cpu().numpy()):
+        raise ValueError("Robot label bounds do not match VAE bounds")
+    for kind in ("robot", "gripper"):
+        grids = []
+        by_shape = {tuple(f[f"{kind}/{lv}"].attrs["shape"]): lv for lv in f[kind]}
+        for level, xyz in enumerate(shapes):
+            zyx = tuple(reversed(xyz))
+            if zyx not in by_shape:
+                raise ValueError(f"Robot label resolution does not match VAE: need {zyx}, file has {list(by_shape)}")
+            d = f[f"{kind}/{by_shape[zyx]}"]
+            mask = np.unpackbits(d[frame], count=int(np.prod(zyx))).reshape(zyx).copy()
+            grids.append(torch.from_numpy(mask).to(device=device, dtype=torch.bool)[None, None])
+        result[kind] = grids
     return result
 
 

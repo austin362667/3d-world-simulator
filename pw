@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# pw — one-word pipeline driver for an ALOHA dataset (see processing/README.md).
+#
+# Data contract: $ADATA/<ds>/ holds episode_N.hdf5 (raw), fs_disp/disp_episode_N.hdf5
+# (FoundationStereo, both sides) and sam3_masks/ (SAM3). Everything derived lives in
+# $APROC/<ds>/ (raw/, fs_disp/, sam3_masks/ symlinked on first use; config.json /
+# cam_crops.json / table_bbox.json seeded from $TEMPLATE).
+#
+# usage:
+#   ./pw setup    <ds>        # create $APROC/<ds>, symlinks, seed JSONs from $TEMPLATE
+#   ./pw status   <ds>        # what exists / what's next
+#   ./pw camera   <ds>        # viser: point cloud, cameras, workspace box; scroll through episodes (:8099)
+#   ./pw voxels   <ds>        # viser: the same with the occupied voxels at a chosen resolution   (:8097)
+#   ./pw cams     <ds>        # viser: the same with every camera image, wrist cameras included   (:8095)
+#        With only downloaded processed data (data/<ds>/packed) these three open the packed viewer.
+#        With raw episodes and stereo depth (fs_disp/) they are the calibration tools below:
+#   ./pw camera   <ds> [ep]   # viser: fixed-cam extrinsics + world bbox -> config.json   (:8099)
+#   ./pw crop     <ds>        # web:   per-cam crop + bbox coverage   -> cam_crops.json + config.json (:8093)
+#   ./pw voxels   <ds> [ep]   # viser: fs_disp scene + occupied voxels at 16/32/64/128/... (:8097; pre-pack OK)
+#   ./pw cams     <ds> [ep]   # viser: ALL cameras per frame incl. wrist cams + object-projection overlay (:8095)
+#   ./pw pack     <ds>        # pack -> SOR -> render bake -> train/val split
+#   ./pw tablebbox <ds>       # web:   cam2-blackout table bbox -> table_bbox.json (:8091; needs packed)
+#
+# env knobs: ADATA (raw root, default raw/), APROC (processed root, default data/), PYTHON (interpreter), TEMPLATE (seed dataset)
+# pack knobs: LRC=2 BLACKOUT="2" HEIGHT_CAMS="" VAL_EPS="" (default ep%10==9)
+#             WORKERS=16 OVERWRITE=0 (1 = repack everything)
+set -uo pipefail
+TP=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ADATA=${ADATA:-${PW_RAW_ROOT:-$TP/raw}}          # raw episodes:      $ADATA/<ds>/episode_N.hdf5
+APROC=${APROC:-${PW_DATA_ROOT:-$TP/data}}        # processed output:  $APROC/<ds>/{packed,train,val,...}  (= --data-root of the trainers)
+PY=${PYTHON:-python}                             # the conda env of environment.yml
+export PW_DATA_ROOT=$APROC PW_RAW_ROOT=$ADATA PYTHONUNBUFFERED=1 NUMPY_MADVISE_HUGEPAGE=0
+export HDF5_USE_FILE_LOCKING=FALSE
+cd "$TP"
+
+CMD=${1:-help}; DS=${2:-}; EP=${3:-0}; EPARG=${3:-}
+TEMPLATE=${TEMPLATE:-bimanual_box}
+
+die() { echo "pw: $*" >&2; exit 1; }
+
+usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0; }
+
+# downloaded processed data only: data/<ds>/packed and no stereo depth -> the packed viewer
+packed_only() { [ -n "$DS" ] && [ -n "$(ls "$APROC/$DS"/packed/episode_*.hdf5 2>/dev/null | head -1)" ] && [ ! -e "$APROC/$DS/fs_disp" ] && [ ! -d "$ADATA/$DS/fs_disp" ]; }
+view_packed() {  # $1 = what is switched on, $2 = default port
+  echo "[$1] viser on :${PORT:-$2} — processed episodes of $DS; scroll through episodes and frames"
+  exec $PY -m processing.viz.view_packed --dataset "$DS" --show "$1" --port "${PORT:-$2}" ${EPARG:+--episode "$EPARG"}
+}
+
+ensure_setup() {
+  [ -n "$DS" ] || die "dataset name required (a dir under $ADATA)"
+  [ -d "$ADATA/$DS" ] || die "$ADATA/$DS does not exist"
+  local R=$APROC/$DS
+  mkdir -p "$R"
+  [ -e "$R/raw" ]     || ln -s "$ADATA/$DS" "$R/raw"
+  [ -e "$R/fs_disp" ] || { [ -d "$ADATA/$DS/fs_disp" ] && ln -s "$ADATA/$DS/fs_disp" "$R/fs_disp"; }
+  [ -e "$R/sam3_masks" ] || { [ -d "$ADATA/$DS/sam3_masks" ] && ln -s "$ADATA/$DS/sam3_masks" "$R/sam3_masks"; }
+  for f in config.json cam_crops.json table_bbox.json; do
+    if [ ! -e "$R/$f" ] && [ -e "$APROC/$TEMPLATE/$f" ]; then
+      cp "$APROC/$TEMPLATE/$f" "$R/$f"
+      echo "[setup] seeded $f from $TEMPLATE (tweak before packing!)"
+      if [ "$f" = cam_crops.json ]; then   # template may run at another resolution: scale rects to the same FOV
+        $PY -m processing.pack.seed_crops --dataset "$DS" --template "$TEMPLATE" | sed 's/^/[setup]   /'
+      fi
+    fi
+  done
+}
+
+counts() {
+  local R=$APROC/$DS
+  echo "raw:     $(ls "$ADATA/$DS"/episode_*.hdf5 2>/dev/null | wc -l) episodes"
+  echo "fs_disp: $(ls "$R"/fs_disp/disp_episode_*.hdf5 2>/dev/null | wc -l)"
+  echo "sam3:    $(ls "$R"/sam3_masks/*.h5 2>/dev/null | wc -l) files"
+  echo "cam_perframe: $(ls "$R"/cam_perframe/ep_*_cam*.npz 2>/dev/null | wc -l) sidecars"
+  for f in config.json cam_crops.json table_bbox.json; do
+    [ -e "$R/$f" ] && echo "$f: present ($(date -r "$R/$f" +%m-%d\ %H:%M))" || echo "$f: MISSING"
+  done
+  echo "packed:  $(ls "$R"/packed/episode_*.hdf5 2>/dev/null | wc -l)"
+  echo "train/val: $(ls "$R"/train/*.hdf5 2>/dev/null | wc -l)/$(ls "$R"/val/*.hdf5 2>/dev/null | wc -l)"
+  echo "robot_label_cache: $(ls "$R"/robot_label_cache/episode_*.h5 2>/dev/null | wc -l)  gripper halo: $(ls "$R"/gripper_supervision/masks_halo6_surface/episode_*.h5 2>/dev/null | wc -l)"
+}
+
+case "$CMD" in
+  setup)  ensure_setup; counts ;;
+
+  status) ensure_setup; counts ;;
+
+  camera)
+    packed_only && view_packed camera 8099
+    ensure_setup
+    echo "[camera] viser on :${PORT:-8099} — drag gizmos, tune bbox, SAVE writes config.json"
+    exec $PY -m processing.viz.tweak_extrinsics --dataset "$DS" --episode "$EP" --port "${PORT:-8099}" ;;
+
+  crop)
+    ensure_setup
+    echo "[crop] web UI on :${PORT:-8093} — drag crop rects; 'save crops' -> cam_crops.json, 'save bbox' -> config.json"
+    exec $PY -m processing.viz.bbox_crop_tweak_web --dataset "$DS" --port "${PORT:-8093}" --write-config ;;
+
+  voxels)
+    packed_only && view_packed voxels 8097
+    ensure_setup
+    echo "[voxels] viser on :${PORT:-8097} — fs_disp scene (live config calib) + occupied voxels at selectable resolution"
+    exec $PY -m processing.viz.view_voxel_res --dataset "$DS" --episode "$EP" --port "${PORT:-8097}" ;;
+
+  cams)
+    packed_only && view_packed cams 8095
+    ensure_setup
+    echo "[cams] viser on :${PORT:-8095} — all cameras per frame (incl. wrist), optional object-projection overlay"
+    exec $PY -m processing.viz.view_all_cams --dataset "$DS" --episode "$EP" --port "${PORT:-8095}" ;;
+
+  tablebbox)
+    ensure_setup
+    [ -n "$(ls "$APROC/$DS"/packed/episode_*.hdf5 2>/dev/null)" ] \
+      || die "needs packed episodes — run './pw pack $DS' first (it stops before the render bake if table_bbox.json is missing)"
+    echo "[tablebbox] web UI on :${PORT:-8091} — tune the blackout box, save -> table_bbox.json, then re-run './pw pack $DS'"
+    exec $PY -m processing.viz.table_bbox_blackout_web --dataset "$DS" --port "${PORT:-8091}" ;;
+
+  pack)
+    ensure_setup
+    R=$APROC/$DS
+    LRC=${LRC:-2}; WORKERS=${WORKERS:-16}; BLACKOUT=${BLACKOUT:-2}; HEIGHT_CAMS=${HEIGHT_CAMS:-}
+    [ -e "$R/config.json" ]    || die "config.json missing — run './pw camera $DS' first"
+    [ -e "$R/cam_crops.json" ] || die "cam_crops.json missing — run './pw crop $DS' first"
+
+    NOOBJ=""
+    [ -d "$R/sam3_masks" ] && [ -n "$(ls "$R"/sam3_masks/*.h5 2>/dev/null)" ] \
+      || { NOOBJ="--no-obj"; echo "[pack] no sam3_masks — packing with --no-obj"; }
+
+    # one BLAS/OpenMP thread per worker: without this each worker spawns ~260 threads and 40 workers crawl (10-12)
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+    echo "[pack 1/4] pack all (lrc=$LRC, v2 full-scene depth${NOOBJ:+, no obj}) ..."
+    $PY -m processing.pack.pack_dataset --dataset "$DS" --episodes all \
+      --lrc-thresh "$LRC" --min-depth 0.10 --max-depth 2.0 --workers "$WORKERS" \
+      $NOOBJ ${OVERWRITE:+--overwrite} || die "pack failed"
+    $PY - "$R" <<'PYEOF' || die "bbox verify failed"
+import h5py, json, numpy as np, sys, glob
+R = sys.argv[1]
+cfg = json.load(open(f"{R}/config.json"))["bbox"]
+f0 = sorted(glob.glob(f"{R}/packed/episode_*.hdf5"))[0]
+with h5py.File(f0) as f:
+    bb = np.asarray(f.attrs["bbox"], float)
+    assert str(f.attrs.get("depth_semantics", "")) == "full_scene_lrc", "not a v2 pack (rerun with OVERWRITE=1)"
+assert np.allclose(bb, cfg, atol=1e-5), f"packed bbox {list(bb)} != config {cfg} (rerun with OVERWRITE=1)"
+print("[verify] v2 pack, bbox matches config:", list(bb))
+PYEOF
+
+    echo "[pack 2/4] SOR (k=10 std=2.0) ..."
+    $PY -m processing.pack.add_sor_mask --dataset "$DS" --packed-dir "$R/packed" \
+      --sor-k 10 --sor-std 2.0 --workers 24 --sor-threads 8 || die "SOR failed"
+
+    if [ -n "$BLACKOUT" ] && [ ! -e "$R/table_bbox.json" ]; then
+      die "table_bbox.json missing — run './pw tablebbox $DS' (packed data now exists), then re-run './pw pack $DS' (already-packed steps are skipped)"
+    fi
+    echo "[pack 3/4] render bake (crops from cam_crops.json, blackout cams: ${BLACKOUT:-none}${HEIGHT_CAMS:+, height-mask cams: $HEIGHT_CAMS}) ..."
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    $PY -m processing.pack.add_render_to_packed --dataset "$DS" \
+      --blackout-cams $BLACKOUT ${HEIGHT_CAMS:+--height-mask-cams $HEIGHT_CAMS} \
+      --workers 32 --skip-existing || die "render bake failed"
+
+    echo "[pack 4/4] train/val split ..."
+    if [ -z "${VAL_EPS:-}" ]; then
+      VAL_EPS=$(ls "$R"/packed/episode_*.hdf5 | sed 's/.*episode_//;s/\.hdf5//' | sort -n | awk '($1 % 10) == 9')
+    fi
+    $PY -m processing.pc.extract_train_val --dataset "$DS" \
+      --pc-dir "$R/packed" --train-dir "$R/train" --val-dir "$R/val" \
+      --val-episodes $VAL_EPS || die "split failed"
+
+    echo "[pack] DONE  packed=$(ls "$R"/packed/*.hdf5 2>/dev/null | wc -l)  train=$(ls "$R"/train/*.hdf5 2>/dev/null | wc -l)  val=$(ls "$R"/val/*.hdf5 2>/dev/null | wc -l)  (val eps: $(echo $VAL_EPS | tr '\n' ' '))" ;;
+
+  help|--help|-h|*) usage ;;
+esac

@@ -579,12 +579,6 @@ class OccupancyVAELocal(nn.Module):
         xyz_world, features = self._prepare_features(xyz, rgb, pos_mean, pos_std)
         return self.encoder(xyz_world, features, B)
 
-    def reparameterize(self, mean, logvar):
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            return mean + torch.randn_like(std) * std
-        return mean
-
     def decode(self, z, occ_mask_0=None, use_gt_mask=True):
         decoded = self.conv_decoder(z)
         return self.decoder(decoded, occ_mask_0=occ_mask_0, use_gt_mask=use_gt_mask)

@@ -2,8 +2,8 @@ from __future__ import annotations
 import glob, os
 from pathlib import Path
 import cv2
-from datasets import color_gain as _color_gain
-import h5py
+
+import h5video
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -62,8 +62,6 @@ class AlohaPackedPCDataset(Dataset):
         pos_mean=None,
         pos_std=None,
         use_sor_filter=True,
-        wrist_e_override_dir=None,
-        wrist_cam=3,
         point_bounds=None,
     ):
         dirs = packed_dir if isinstance(packed_dir, (list, tuple)) else [packed_dir]
@@ -73,9 +71,6 @@ class AlohaPackedPCDataset(Dataset):
         )
         if not self.files:
             raise FileNotFoundError(f"no packed episodes under {packed_dir}")
-        self.wrist_e_dir = wrist_e_override_dir
-        self.wrist_cam = wrist_cam
-        self._wrist_e = {}
         self.n_points = n_points
         self.pos_mean = None if pos_mean is None else np.asarray(pos_mean, np.float32)
         self.pos_std = None if pos_std is None else np.asarray(pos_std, np.float32)
@@ -85,7 +80,7 @@ class AlohaPackedPCDataset(Dataset):
         self.index = []
         self.ep_meta = []
         for ei, fp in enumerate(self.files):
-            with h5py.File(fp, "r") as f:
+            with h5video.File(fp, "r") as f:
                 T = int(f.attrs["num_frames"])
                 self.ep_meta.append(
                     dict(
@@ -124,7 +119,7 @@ class AlohaPackedPCDataset(Dataset):
 
     def _h(self, ei):
         if ei not in self._handles:
-            self._handles[ei] = h5py.File(self.files[ei], "r")
+            self._handles[ei] = h5video.File(self.files[ei], "r")
         return self._handles[ei]
 
     def __len__(self):
@@ -141,7 +136,6 @@ class AlohaPackedPCDataset(Dataset):
         ei, t = self.index[i]
         f = self._h(ei)
         meta = self.ep_meta[ei]
-        _H, _W = (meta["H"], meta["W"])
         rng = np.random.default_rng(i)
         pts, rgb, obj = ([], [], [])
         for c in meta["cam_ids"]:
@@ -149,17 +143,9 @@ class AlohaPackedPCDataset(Dataset):
             mkey = f"img/camera_{c}/filter_mask" if self.use_sor_filter and meta["has_filter"] else f"img/camera_{c}/valid_mask"
             valid = _unpack_mask(f[mkey][t], *depth.shape)
             rgb_ir = cv2.cvtColor(cv2.imdecode(f[f"img/camera_{c}/rgb_in_ir"][t], cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-            rgb_ir = _color_gain.apply(rgb_ir, self.files[ei], c)
             objm = f[f"img/camera_{c}/obj_mask"][t] if meta["has_obj"] else None
             K_ir = f[f"cam/camera_{c}/K_ir"][t]
             E = f[f"cam/camera_{c}/E_cam2world"][t]
-            if self.wrist_e_dir is not None and c == self.wrist_cam:
-                ov = self._wrist_e.get(ei)
-                if ov is None:
-                    p = os.path.join(self.wrist_e_dir, f"ep_{meta['ep_id']}_tfref.npz")
-                    ov = self._wrist_e[ei] = np.load(p)["E_cam2world"] if os.path.exists(p) else False
-                if ov is not False and t < len(ov) and np.isfinite(ov[t]).all():
-                    E = ov[t].astype(E.dtype)
             p, cgb, o = _lift_camera(depth, valid, rgb_ir, objm, K_ir, E)
             if objm is None and meta.get("has_render_obj"):
                 o = _render_obj_labels(f, c, t, p)

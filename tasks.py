@@ -1,6 +1,6 @@
 TASKS = {
     "cloth": dict(
-        datasets=["bimanual_cloth_v3", "bimanual_cloth_policy_eval", "bimanual_cloth_free", "bimanual_cloth_new"],
+        datasets=["cloth"],
         grid=(64, 32, 64),
         x_range=(-0.35, 0.35),
         y_range=(-0.16, 0.26),
@@ -8,17 +8,8 @@ TASKS = {
         wrist_cams=[3, 4],
         tactile=True,
     ),
-    "rope": dict(
-        datasets=["bimanual_rope_free", "bimanual_rope_new"],
-        grid=(64, 32, 32),
-        x_range=(-0.47, 0.4),
-        y_range=(-0.19, 0.23),
-        z_range=(-0.09, 0.26),
-        wrist_cams=[3, 4],
-        tactile=True,
-    ),
-    "plug": dict(
-        datasets=["bimanual_plug_insertion_v3"],
+    "assembly": dict(
+        datasets=["assembly"],
         grid=(64, 16, 64),
         x_range=(-0.34, 0.24),
         y_range=(-0.095, 0.12),
@@ -26,17 +17,8 @@ TASKS = {
         wrist_cams=[3],
         tactile=True,
     ),
-    "marker": dict(
-        datasets=["bimanual_marker"],
-        grid=(64, 16, 64),
-        x_range=(-0.34, 0.24),
-        y_range=(-0.095, 0.12),
-        z_range=(-0.085, 0.295),
-        wrist_cams=[],
-        tactile=True,
-    ),
     "pusht": dict(
-        datasets=["bimanual_pusht_v2"],
+        datasets=["pusht"],
         grid=(64, 64, 16),
         x_range=(-0.48, 0.38),
         y_range=(-0.37, 0.37),
@@ -45,7 +27,7 @@ TASKS = {
         tactile=False,
     ),
     "box": dict(
-        datasets=["bimanual_box_free", "bimanual_box_v2", "bimanual_box_demo"],
+        datasets=["box"],
         grid=(64, 64, 32),
         x_range=(-0.48, 0.39),
         y_range=(-0.35, 0.37),

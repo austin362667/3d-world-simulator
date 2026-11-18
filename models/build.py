@@ -37,12 +37,15 @@ def add_tactile(model, reach=2.0):
 
 
 def load_vae(ckpt, device):
+    """The autoencoder of a checkpoint, with its tactile particle head when the checkpoint has one."""
     a = ckpt["args"]
-    state = {k: v for k, v in ckpt["model_state_dict"].items() if not k.startswith("tactile_particle_head.")}
+    state = ckpt["model_state_dict"]
     grid = a["grid"] if "grid" in a else (a["nx"], a["ny"], a["nz"])
     model = make_vae(grid, a["x_range"], a["y_range"], a["z_range"])
     if any(".occ_head_" in k and v.shape[0] == 5 for k, v in state.items()):
         extend_occ_heads(model.decoder)
+    if any(k.startswith("tactile_particle_head.") for k in state):
+        model.tactile_particle_head = TactileParticleHead(64, K=16, reach=float(a.get("tactile_particle_reach", 2.0)))
     model.load_state_dict(state)
     return model.to(device).eval()
 

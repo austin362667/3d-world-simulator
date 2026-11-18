@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import h5video  # noqa: E402
 from datasets.aloha_packed import AlohaPackedPCDataset
 from models.build import load_vae, normalize_latent
 from models.tactile import fire_color
@@ -105,11 +106,12 @@ def main():
             continue
         frames = sorted(frames_of[ei])[: a.max_frames]
         T = len(frames)
-        with h5py.File(ds.files[ei], "r") as f:
+        with h5video.File(ds.files[ei], "r") as f:
             actions = f["action/cartesian_action"][:].astype(np.float32)
             K = np.stack([f[f"cam/camera_{c_}/K_ir"][:].astype(np.float32) for c_ in meta["cam_ids"]], 1)
             E = np.stack([f[f"cam/camera_{c_}/E_cam2world"][:].astype(np.float32) for c_ in meta["cam_ids"]], 1)
-        tac = np.load(Path(meta["root"]) / "tactile_targets" / f"episode_{meta['ep_id']}.npz") if tactile else None
+        with h5video.File(ds.files[ei], "r") as f:
+            tac = dict(xyz=f["tactile_targets/xyz"][...], sig=f["tactile_targets/sig"][...]) if tactile and "tactile_targets" in f else None
         zs, occ = [], []
         for t, gi in frames:
             s = ds[gi]

@@ -31,10 +31,15 @@ class TactileParticleHead(nn.Module):
         return torch.cat([v[b, :, z + dz, y + dy, x + dx] for dz in (0, 1, 2) for dy in (0, 1, 2) for dx in (0, 1, 2)], 1)
 
     def forward(self, f, tac, seeds, bmin, vsize):
-        D, H, W = f.shape[2:]
+        """f: the finest decoder features, dense (1, C, D, H, W) or held sparsely (models.sparse_decoder.SparseFeatures)."""
+        D, H, W = f.shape[-3:]
         b, z, y, x = seeds.unbind(1)
         pos = torch.stack([x / max(W - 1, 1), y / max(H - 1, 1), z / max(D - 1, 1)], 1).float() * 2 - 1
-        o = self.mlp(torch.cat([self.gather27(torch.cat([f, tac], 1).float(), seeds), pos], 1)).view(-1, self.K, 5)
+        if hasattr(f, "gather_nbrs"):
+            nb = torch.cat([f.gather_nbrs(seeds), self.gather27(tac.float(), seeds).view(seeds.shape[0], 27, -1)], 2).flatten(1)
+        else:
+            nb = self.gather27(torch.cat([f, tac], 1).float(), seeds)
+        o = self.mlp(torch.cat([nb, pos], 1)).view(-1, self.K, 5)
         centre = bmin + (torch.stack([x, y, z], 1).float() + 0.5) * vsize
         return centre[:, None] + torch.tanh(o[..., :3]) * self.reach * vsize, o[..., 3], o[..., 4]
 

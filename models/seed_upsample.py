@@ -1,72 +1,6 @@
 import torch
-import torch.nn as nn
 
-N_PARTICLES_PER_SEED = 4
 NEIGHBOR_OFFSETS = [(dz, dy, dx) for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
-
-
-def _init_particle_offsets(n_particles=4, scale=0.25):
-    if n_particles == 4:
-        init = (
-            torch.tensor([[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]], dtype=torch.float32) * scale
-        )
-    else:
-        indices = torch.arange(n_particles, dtype=torch.float32)
-        phi = torch.acos(1 - 2 * (indices + 0.5) / n_particles)
-        theta = torch.pi * (1 + 5**0.5) * indices
-        init = torch.stack([torch.sin(phi) * torch.cos(theta), torch.sin(phi) * torch.sin(theta), torch.cos(phi)], dim=-1) * scale
-    return init
-
-
-class SeedUpsampler(nn.Module):
-
-    def __init__(self, feat_dim=32, hidden=64, n_heads=4, n_particles=N_PARTICLES_PER_SEED, max_offset=0.5):
-        super().__init__()
-        assert hidden % n_heads == 0, "hidden must be divisible by n_heads"
-        self.n_particles = n_particles
-        self.n_heads = n_heads
-        self.hidden = hidden
-        self.head_dim = hidden // n_heads
-        self.max_offset = max_offset
-        self.pos_embed = nn.Parameter(torch.randn(27, hidden) * 0.02)
-        self.query = nn.Parameter(torch.randn(n_particles, hidden) * 0.02)
-        self.in_proj = nn.Linear(feat_dim, hidden)
-        self.k_proj = nn.Linear(hidden, hidden)
-        self.v_proj = nn.Linear(hidden, hidden)
-        self.out_proj = nn.Linear(hidden, hidden)
-        self.norm_attn = nn.LayerNorm(hidden)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(hidden), nn.Linear(hidden, hidden * 2), nn.SiLU(inplace=True), nn.Linear(hidden * 2, hidden)
-        )
-        self.head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.SiLU(inplace=True), nn.Linear(hidden, 6))
-        init_offsets = _init_particle_offsets(n_particles, scale=max_offset * 0.5)
-        self.register_buffer("init_offsets", init_offsets)
-
-    def forward(self, neighborhood_feats, return_feat=False):
-        S = neighborhood_feats.shape[0]
-        H = self.n_heads
-        d = self.head_dim
-        P = self.n_particles
-        x = self.in_proj(neighborhood_feats) + self.pos_embed.unsqueeze(0)
-        K = self.k_proj(x).view(S, 27, H, d).permute(0, 2, 1, 3)
-        V = self.v_proj(x).view(S, 27, H, d).permute(0, 2, 1, 3)
-        Q = self.query.unsqueeze(0).expand(S, -1, -1)
-        Q = Q.view(S, P, H, d).permute(0, 2, 1, 3)
-        attn = torch.einsum("shpd,shnd->shpn", Q, K) / d**0.5
-        attn = attn.softmax(dim=-1)
-        out = torch.einsum("shpn,shnd->shpd", attn, V)
-        out = out.permute(0, 2, 1, 3).reshape(S, P, H * d)
-        out = self.out_proj(out)
-        out = self.norm_attn(out)
-        out = out + self.ffn(out)
-        raw = self.head(out)
-        offset_raw, rgb_raw = raw.chunk(2, dim=-1)
-        offset = torch.tanh(offset_raw) * self.max_offset + self.init_offsets.unsqueeze(0)
-        offset = offset.clamp(-self.max_offset, self.max_offset)
-        rgb = torch.tanh(rgb_raw)
-        if return_feat:
-            return (offset, rgb, out)
-        return (offset, rgb)
 
 
 def gather_neighborhood_features(feat_grid, seed_indices):
@@ -203,11 +137,53 @@ def local_chamfer_loss(
     return (cd_loss + rgb_weight * rgb_loss, fwd_diag, bwd_diag, rgb_loss.detach())
 
 
-def compute_particle_world_coords(seed_indices, offsets_normalized, bounds_min, voxel_size):
-    S, P, _ = offsets_normalized.shape
-    xc = bounds_min[0] + (seed_indices[:, 3].float() + 0.5) * voxel_size[0]
-    yc = bounds_min[1] + (seed_indices[:, 2].float() + 0.5) * voxel_size[1]
-    zc = bounds_min[2] + (seed_indices[:, 1].float() + 0.5) * voxel_size[2]
-    centers = torch.stack([xc, yc, zc], dim=-1)
-    world = centers.unsqueeze(1) + offsets_normalized * voxel_size.view(1, 1, 3)
-    return world
+def two_round_chamfer_loss(
+    seed_indices,
+    head_out,
+    gt_xyz,
+    gt_rgb,
+    bounds_min,
+    voxel_size,
+    fine_shape,
+    rgb_weight=0.1,
+    kernel=3,
+    seed_weights=None,
+    round2_weight=1.0,
+    bwd_weight=1.0,
+):
+    r1_xyz, r1_rgb, r2_xyz, r2_rgb = head_out
+    if r1_xyz.shape[0] == 0:
+        z = torch.zeros((), device=r1_xyz.device)
+        return (z, z, z, z, z, z)
+    cd1, f1, b1, g1 = local_chamfer_loss(
+        seed_indices,
+        r1_xyz,
+        r1_rgb,
+        gt_xyz,
+        gt_rgb,
+        bounds_min,
+        voxel_size,
+        fine_shape=fine_shape,
+        rgb_weight=rgb_weight,
+        kernel=kernel,
+        seed_weights=seed_weights,
+        bwd_weight=bwd_weight,
+        return_components=True,
+    )
+    cd2, f2, b2, g2 = local_chamfer_loss(
+        seed_indices,
+        r2_xyz,
+        r2_rgb,
+        gt_xyz,
+        gt_rgb,
+        bounds_min,
+        voxel_size,
+        fine_shape=fine_shape,
+        rgb_weight=rgb_weight,
+        kernel=kernel,
+        seed_weights=seed_weights,
+        bwd_weight=bwd_weight,
+        return_components=True,
+    )
+    return (cd1 + round2_weight * cd2, cd1, cd2, f1 + f2, b1 + b2, g1 + g2)
+

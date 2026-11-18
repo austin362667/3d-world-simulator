@@ -28,7 +28,7 @@ from models.losses import (
     compute_rgb_target,
     rasterize_object_voxel_masks_multi,
 )
-from models.seed_upsample_two_round import two_round_chamfer_loss
+from models.seed_upsample import two_round_chamfer_loss
 from models.tactile import PAD_SAMPLES_PER_PAD, dense_pad, fire_color, rasterise, surface_loss
 from tasks import TASKS
 
@@ -40,13 +40,14 @@ def encode(model, xyz, rgb, pos_mean, pos_std):
     return normalize_latent(model.encode(xyz, rgb, pos_mean=pos_mean, pos_std=pos_std)[0], model.latent_split)
 
 
-def tactile_targets(root, ep):
-    key = (str(root), ep)
+def tactile_targets(f):
+    """Taxel positions and signals of a packed episode (its ``tactile_targets`` group), or None."""
+    key = f.filename
     if key not in TACTILE_CACHE:
-        p = Path(root) / "tactile_targets" / f"episode_{ep}.npz"
         if len(TACTILE_CACHE) > 64:
             TACTILE_CACHE.clear()
-        TACTILE_CACHE[key] = dict(np.load(p)) if p.exists() else None
+        g = f.get("tactile_targets")
+        TACTILE_CACHE[key] = None if g is None else dict(xyz=g["xyz"][...], sig=g["sig"][...], has_tac=bool(g.attrs.get("has_tac", True)))
     return TACTILE_CACHE[key]
 
 
@@ -103,7 +104,7 @@ def seed_chamfer(m, seeds, seed_cls, r1, r2, xyz_world, rgb, obj, obj_grids, gri
     )
     z = (seeds[:, 0], 0, seeds[:, 1], seeds[:, 2], seeds[:, 3])
     weights = torch.maximum(
-        torch.ones(seeds.shape[0], device=device) + 9.0 * obj_grids[-1][z].float(), gripper_grids[-1][z].float() * 20.0
+        torch.ones(seeds.shape[0], device=device) + m.obj_alpha * obj_grids[-1][z].float(), gripper_grids[-1][z].float() * 20.0
     )
     labels = partition_points(xyz_world, obj, robot_grid, bmin, vsize)
     cd = torch.zeros((), device=device)
@@ -141,7 +142,7 @@ def render_losses(m, fg, rcams, dcams):
         keep_grad=False,
         lpips_fn=m.lpips,
         gripper_lpips_weight=2.0,
-        obj_alpha=9.0,
+        obj_alpha=m.obj_alpha,
         obj_band_px=10,
         gripper_weight=20.0,
         band_outside_valid=False,
@@ -165,7 +166,7 @@ def step(m, batch, train, seed_active, frames, epoch, chamfer, chamfer_rgb, hold
     m.features.pop("feat_2", None)
     xyz, rgb, obj = (batch[k].to(device, non_blocking=True) for k in ("xyz", "rgb", "is_rope"))
     B, N, _ = xyz.shape
-    root, ep, frame, fi = batch["root"][0], int(batch["ep_idx"][0]), int(batch["frame_idx"][0]), int(batch["file_idx"][0])
+    frame, fi = int(batch["frame_idx"][0]), int(batch["file_idx"][0])
     if N >= N_POINTS:
         n = int(torch.randint(N_POINTS, min(N_POINTS, N) + 1, (1,)).item())
         idx = torch.randperm(N, device=device)[:n]
@@ -176,7 +177,7 @@ def step(m, batch, train, seed_active, frames, epoch, chamfer, chamfer_rgb, hold
     xyz_world = xyz * pstd + pmean
     tac = None
     xyz_enc, rgb_enc = xyz, rgb
-    tt = tactile_targets(root, ep) if m.tactile else None
+    tt = tactile_targets(frames.file(fi)) if m.tactile else None
     if tt is not None and bool(tt["has_tac"]):
         f = min(frame, len(tt["xyz"]) - 1)
         tac_X, tac_S = torch.from_numpy(tt["xyz"][f].reshape(-1, 3)).to(device), torch.from_numpy(tt["sig"][f].reshape(-1)).to(
@@ -207,24 +208,30 @@ def step(m, batch, train, seed_active, frames, epoch, chamfer, chamfer_rgb, hold
     object_grids = rasterize_object_voxel_masks_multi(
         xyz_world, obj.bool(), m.bbox_min, m.bbox_extent, [(s[2], s[1], s[0]) for s in model.grid_shapes]
     )
-    labels = load_frame(Path(root) / "robot_label_cache", ep, frame, model.grid_shapes, bmin, bmax, device)
-    gripper_grids = expand_gripper_grids(labels["gripper"], 6)
     robot_core, robot_valid = [], []
-    for level, (r, o, occ) in enumerate(zip(labels["robot"], object_grids, occ_targets)):
-        heights = bmin[2] + torch.arange(r.shape[-3], device=device) * (bmax[2] - bmin[2]) / r.shape[-3]
-        halo = (6 * model.grid_shapes[level][0] + nx - 1) // nx
-        res = resolve_robot_labels(
-            r, o, occ > 0.5, object_halo_vox=0, robot_halo_vox=halo, table_cells=(heights <= -0.06)[None, None, :, None, None]
-        )
-        robot_core.append(res[0])
-        robot_valid.append(res[1])
+    if m.full:  # robot and gripper voxel labels stored in the episode
+        labels = load_frame(frames.file(fi), frame, model.grid_shapes, bmin, bmax, device)
+        gripper_grids = expand_gripper_grids(labels["gripper"], 6)
+        for level, (r, o, occ) in enumerate(zip(labels["robot"], object_grids, occ_targets)):
+            heights = bmin[2] + torch.arange(r.shape[-3], device=device) * (bmax[2] - bmin[2]) / r.shape[-3]
+            halo = (6 * model.grid_shapes[level][0] + nx - 1) // nx
+            res = resolve_robot_labels(
+                r, o, occ > 0.5, object_halo_vox=0, robot_halo_vox=halo, table_cells=(heights <= -0.06)[None, None, :, None, None]
+            )
+            robot_core.append(res[0])
+            robot_valid.append(res[1])
+    else:  # no robot labels: the robot class is trained to stay empty, so every voxel is object or scene
+        gripper_grids = [torch.zeros((1, 1, s[2], s[1], s[0]), dtype=torch.bool, device=device) for s in model.grid_shapes]
+        robot_core = [torch.zeros_like(g) for g in gripper_grids]
+        robot_valid = [torch.ones_like(g) for g in gripper_grids]
     obj_grids = [(F.max_pool3d(o.float(), 3, 1, 1) > 0.5) for o in object_grids]
     obj_grids = [o & ~g if o.dtype == torch.bool else o * ~g for o, g in zip(obj_grids, gripper_grids)]
     loss = compute_occupancy_loss(occ_logits, occ_targets, out["rgb_2"], rgb_target, occ_targets[-1], rgb_weight=1.0)[0]
-    loss = loss + compute_object_bce_addon(occ_logits, occ_targets, obj_grids, 9.0)
-    loss = loss + compute_object_rgb_addon(out["rgb_2"], rgb_target, occ_targets[-1], obj_grids[-1], 9.0)
-    loss = loss + compute_object_bce_addon(occ_logits, occ_targets, gripper_grids, 19.0)
-    loss = loss + compute_object_rgb_addon(out["rgb_2"], rgb_target, occ_targets[-1], gripper_grids[-1], 19.0)
+    loss = loss + compute_object_bce_addon(occ_logits, occ_targets, obj_grids, m.obj_alpha)  # both are zero in the minimal recipe
+    loss = loss + compute_object_rgb_addon(out["rgb_2"], rgb_target, occ_targets[-1], obj_grids[-1], m.obj_alpha)
+    if m.full:
+        loss = loss + compute_object_bce_addon(occ_logits, occ_targets, gripper_grids, 19.0)
+        loss = loss + compute_object_rgb_addon(out["rgb_2"], rgb_target, occ_targets[-1], gripper_grids[-1], 19.0)
     robot_loss = (
         sum(masked_robot_bce(l, c.float().expand(B, -1, -1, -1, -1), v) for l, c, v in zip(robot_logits, robot_core, robot_valid))
         / levels
@@ -317,6 +324,13 @@ def main():
     p.add_argument("--data-root", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--datasets", nargs="+", default=None)
+    p.add_argument(
+        "--recipe",
+        choices=("minimal", "full"),
+        default="full",
+        help="minimal: no extra weighting. full: adds the object and gripper weighting, the robot class and the tactile heads, from the "
+        "labels stored in the packed episodes (the released models)",
+    )
     p.add_argument("--n-epochs", type=int, default=500)
     p.add_argument("--iters", type=int, default=500)
     p.add_argument("--val-iters", type=int, default=20)
@@ -361,7 +375,8 @@ def main():
     head = BigHeadRoundShim(feat_dim=64, K=16, shape="aniso").to(device)
     features = {}
     model.decoder.up_finest.register_forward_hook(lambda m_, i, o: features.__setitem__("feat_2", o))
-    if T["tactile"]:
+    full = a.recipe == "full"
+    if T["tactile"] and full:
         add_tactile(model)
         model.to(device)
     bb = tuple(float(v) for i in range(3) for v in (bbox_min[i], bbox_min[i] + bbox_extent[i]))
@@ -389,7 +404,7 @@ def main():
         start, best = int(ck["epoch"]) + 1, float(ck["best_val_loss"])
         for _ in range(start):
             scheduler.step()
-    train_frames, val_frames = Frames(train_ds.files, device), Frames(val_ds.files, device)
+    train_frames, val_frames = Frames(train_ds.files, device, gripper=full), Frames(val_ds.files, device, gripper=full)
     lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(device).eval()
     lpips_fn.requires_grad_(False)
     lpips_fn.to(memory_format=torch.channels_last)
@@ -404,7 +419,9 @@ def main():
         scheduler=scheduler,
         pos_mean=pos_mean,
         pos_std=pos_std,
-        tactile=T["tactile"],
+        tactile=T["tactile"] and full,
+        full=full,
+        obj_alpha=9.0 if full else 0.0,
         bbox_min=torch.as_tensor(bbox_min, device=device),
         bbox_extent=torch.as_tensor(bbox_extent, device=device),
     )
@@ -430,7 +447,7 @@ def main():
             best_val_loss=best,
             pos_mean=pos_mean,
             pos_std=pos_std,
-            args=dict(grid=T["grid"], x_range=T["x_range"], y_range=T["y_range"], z_range=T["z_range"]),
+            args=dict(grid=T["grid"], x_range=T["x_range"], y_range=T["y_range"], z_range=T["z_range"], recipe=a.recipe),
         )
         torch.save(ck, out / "checkpoints" / "latest.pth")
         if val < best:

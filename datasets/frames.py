@@ -1,13 +1,11 @@
-import os
 import threading
 from collections import OrderedDict
 import cv2
-import h5py
+
+import h5video
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets.color_gain import apply as color_gain
-from datasets.color_gain import root_of
 
 
 class LRU:
@@ -34,48 +32,38 @@ def bits(data, h, w):
 class Frames:
 
     def __init__(
-        self, files, device, gripper_dir="gripper_supervision/masks_halo6_surface", box_dir="sam3_masks", disp_dir="fs_disp"
+        self,
+        files,
+        device,
+        gripper=True,
     ):
-        self.files, self.device, self.gripper_dir, self.box_dir, self.disp_dir = (
-            list(files),
-            device,
-            gripper_dir,
-            box_dir,
-            disp_dir,
-        )
-        self.h5, self.disp = ({}, {})
+        """Render and depth targets of packed episodes. Everything comes from the episode file; ``gripper=False`` leaves the
+        gripper masks out (minimal recipe)."""
+        self.files, self.device, self.gripper = list(files), device, gripper
+        self.h5 = {}
         self.render_cache, self.depth_cache = (LRU(self.read_render, 256), LRU(self.read_depth, 16))
 
     def file(self, fi):
         if fi not in self.h5:
-            self.h5[fi] = h5py.File(self.files[fi], "r")
+            self.h5[fi] = h5video.File(self.files[fi], "r")
         return self.h5[fi]
-
-    def side(self, fi, rel):
-        return root_of(self.files[fi]) / rel
 
     def read_render(self, fi, frame):
         f, cams = (self.file(fi), [])
-        ep = int(f.attrs["episode"])
         for c in [int(x) for x in f.attrs.get("render_cam_ids", f.attrs["cam_ids"])]:
             g = f[f"render/camera_{c}"]
             vm = g["viewmat"][frame].astype(np.float32)
             if not np.isfinite(vm).all():
                 continue
             rgb = np.ascontiguousarray(cv2.imdecode(np.asarray(g["jpg"][frame], dtype=np.uint8), cv2.IMREAD_COLOR)[..., ::-1])
-            rgb = color_gain(rgb, self.files[fi], c)
             h, w = rgb.shape[:2]
             obj = bits(g["obj_mask"][frame], h, w) if "obj_mask" in g else None
             valid = bits(g["valid_mask"][frame], h, w) if "valid_mask" in g else np.ones((h, w), bool)
-            with h5py.File(self.side(fi, self.gripper_dir) / f"episode_{ep}.h5", "r") as side:
-                gripper = bits(side[f"camera_{c}"]["gripper_mask"][frame], h, w)
-            box = self.side(fi, self.box_dir) / f"episode_{ep}_camera_{c}.h5"
-            if box.exists():
-                with h5py.File(box, "r") as side:
-                    match = np.flatnonzero(side["frame_indices"][:] == frame)
-                    if len(match):
-                        x0, y0, x1, y1 = map(int, g.attrs["crop"])
-                        obj = side["mask_union"][int(match[0]), y0:y1, x0:x1].astype(bool)
+            gripper = None
+            if self.gripper:
+                if "gripper_mask" not in g:
+                    raise KeyError(f"{self.files[fi]} has no gripper masks: run scripts/consolidate_packed.py, or train with --recipe minimal")
+                gripper = bits(g["gripper_mask"][frame], h, w)
             cams.append(
                 dict(
                     rgb=rgb,
@@ -103,7 +91,7 @@ class Frames:
             t = {k: torch.from_numpy(c[k]).to(dev) for k in ("K", "viewmat", "valid")}
             t.update(
                 rgb=torch.from_numpy(c["rgb"]).to(dev).float() / 255.0,
-                gripper=torch.from_numpy(c["gripper"]).to(dev),
+                gripper=torch.from_numpy(c["gripper"]).to(dev) if c["gripper"] is not None else None,
                 H=c["H"],
                 W=c["W"],
                 cid=c["cid"],
@@ -114,39 +102,21 @@ class Frames:
 
     def read_depth(self, fi, frame):
         f, cams = (self.file(fi), [])
-        if fi not in self.disp:
-            src = str(f.attrs.get("src_episode", os.path.basename(self.files[fi])))
-            self.disp[fi] = h5py.File(str(self.side(fi, self.disp_dir) / ("disp_" + src)), "r")
-        d = self.disp[fi]
-        for c in [int(x) for x in f.attrs["cam_ids"]]:
+        for c in [int(x) for x in f.attrs["cam_ids"]]:  # the packed full-scene depth (left-right check applied, 0 = hole)
             try:
                 viewmat = np.linalg.inv(f[f"cam/camera_{c}/E_cam2world"][frame].astype(np.float32)).astype(np.float32)
             except np.linalg.LinAlgError:
                 continue
-            cam = dict(
-                K=f[f"cam/camera_{c}/K_ir"][frame].astype(np.float32),
-                viewmat=viewmat,
-                cid=c,
-                disp=d[f"disp/camera_{c}"][frame],
-                baseline=float(d[f"meta/camera_{c}/baseline"][frame]),
+            cams.append(
+                dict(K=f[f"cam/camera_{c}/K_ir"][frame].astype(np.float32), viewmat=viewmat, cid=c, depth=f[f"img/camera_{c}/depth"][frame])
             )
-            if f"disp_right/camera_{c}" in d:
-                cam["disp_r"] = d[f"disp_right/camera_{c}"][frame]
-            cams.append(cam)
         return cams
 
-    def depth(self, fi, frame, max_depth=3.0, lrc=8.0):
+    def depth(self, fi, frame, max_depth=3.0):
         out, dev = ([], self.device)
         for c in self.depth_cache((fi, frame)):
-            disp = torch.from_numpy(np.ascontiguousarray(c["disp"])).to(dev).float()
-            d = float(c["K"][0, 0]) * c["baseline"] / disp.clamp(min=1e-06)
-            d[(disp <= 0.5) | (d > max_depth)] = 0.0
-            if "disp_r" in c:
-                dr = torch.from_numpy(np.ascontiguousarray(c["disp_r"])).to(dev).float()
-                W = disp.shape[1]
-                xr = torch.round(torch.arange(W, device=dev, dtype=disp.dtype).expand_as(disp) - disp).long()
-                match = torch.gather(dr, 1, xr.clamp(0, W - 1))
-                d[~((xr >= 0) & (xr < W) & ((disp - match).abs() <= lrc))] = 0.0
+            d = torch.from_numpy(np.ascontiguousarray(c["depth"])).to(dev).float()
+            d[~torch.isfinite(d) | (d > max_depth)] = 0.0
             d = d.clamp(min=0)
             dmin = d.clone()
             dmin[dmin <= 0] = float("inf")

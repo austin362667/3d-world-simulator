@@ -37,7 +37,8 @@ def build_background_init(
     table_radius: float = 1.4,
     fs_max_depth: float = 3.5,
 ):
-    import h5py, cv2
+    import cv2
+    import h5video
 
     rng = np.random.default_rng(seed)
     bb = np.asarray(bbox, np.float32)
@@ -47,7 +48,7 @@ def build_background_init(
     fs_dmax = {}
     files = list(packed_files)[:max_eps]
     for ei, pf in enumerate(files):
-        with h5py.File(pf, "r") as p:
+        with h5video.File(pf, "r") as p:
             int(p.attrs["H"])
             int(p.attrs["W"])
             T = int(p.attrs["num_frames"])

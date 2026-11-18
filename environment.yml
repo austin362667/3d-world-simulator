@@ -11,9 +11,17 @@ dependencies:
       - torch==2.11.0
       - numpy==2.2.6
       - h5py==3.16.0
+      - av  # lossless video inside HDF5 (h5video.py)
       - opencv-python-headless==5.0.0.93
       - einops==0.8.2
       - lpips==0.1.4
       - gsplat==1.5.3
       - scipy==1.15.3
       - spconv-cu126==2.3.8
+      - transforms3d==0.4.2
+      - tqdm
+      - pytest
+      - huggingface_hub
+      - viser          # only for the camera calibration viewers of ./pw
+      - fastapi        # the interactive demo (demo/server.py)
+      - uvicorn[standard]

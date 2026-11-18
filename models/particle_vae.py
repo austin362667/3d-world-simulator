@@ -70,25 +70,3 @@ class ParticleVAE(OccupancyVAELocal):
             fzk = old.final_z_mix[0].kernel_size[0]
         self.decoder = _ParticleDecoder(grid_feat_dim=gfd, channels=channels, final_z_kernel=fzk, **self._decoder_kwargs)
 
-    def load_scene_backbone(self, scene_ckpt_path: str | None = None, state_dict: dict | None = None) -> dict:
-        if state_dict is None:
-            assert scene_ckpt_path is not None
-            ck = torch.load(scene_ckpt_path, map_location="cpu", weights_only=False)
-            state_dict = ck["model_state_dict"]
-        sd = dict(state_dict)
-        target = self.state_dict()
-        for i in range(len(self.grid_shapes)):
-            wkey = f"decoder.occ_head_{i}.weight"
-            bkey = f"decoder.occ_head_{i}.bias"
-            if wkey in sd and target[wkey].shape != sd[wkey].shape:
-                new_w = target[wkey].clone()
-                new_b = target[bkey].clone()
-                new_w[0] = sd[wkey][0]
-                new_b[0] = sd[bkey][0]
-                sd[wkey] = new_w
-                sd[bkey] = new_b
-        info = self.load_state_dict(sd, strict=False)
-        return info
-
-
-OccupancyVAELocalTactileHead = ParticleVAE

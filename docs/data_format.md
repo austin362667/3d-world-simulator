@@ -6,12 +6,6 @@ One root per dataset. Only the fields below are read.
 <root>/
   train/episode_<E>.hdf5
   val/episode_<E>.hdf5
-  fs_disp/disp_episode_<E>.hdf5
-  sam3_masks/episode_<E>_camera_<C>.h5
-  gripper_supervision/masks_halo6_surface/episode_<E>.h5
-  robot_label_cache/episode_<E>.h5
-  tactile_targets/episode_<E>.npz
-  packing/color_gain_extra.json      optional
 ```
 
 `T` is frames in the episode. Cameras are `C` in `cam_ids`. Positions are metres in the world frame. Depth is `H x W`, the render crop is `h x w`. Packed masks are `np.packbits` of the flattened boolean image, one row per frame.
@@ -51,9 +45,28 @@ Datasets:
 
 `render/camera_C` carries attributes `H`, `W` and `crop = [x0, y0, x1, y1]`.
 
-## Side files
+## Labels stored in the episode
 
-**`fs_disp/disp_episode_<E>.hdf5`**: stereo disparity for the depth loss and free-space carving.
+Written by `scripts/consolidate_packed.py` from the label folders of the processing steps. An episode without them trains
+with `--recipe minimal`.
+
+| Path | Shape | Meaning |
+|---|---|---|
+| `render/camera_C/obj_mask` | `T, hw/8` | packed object mask of the render crop (the SAM3 mask where one exists) |
+| `render/camera_C/gripper_mask` | `T, hw/8` | packed gripper region of the render crop, for the gripper weighting |
+| `labels/robot/<level>`, `labels/gripper/<level>` | `T, zyx/8` | packed voxel labels at each decoder level, attribute `shape = (z, y, x)`; `labels` carries `bounds` (2 x 3), which must match the task |
+| `tactile_targets/xyz` | `T, 4, 384, 3` | taxel positions, 4 pads of 12 x 32 taxels |
+| `tactile_targets/sig` | `T, 4, 384` | taxel signals in 0..1; attribute `has_tac` on the group |
+
+Depth (`img/camera_C/depth`) is stored as lossless video: one FFV1 packet per frame in a variable-length byte dataset,
+decoded bit-exactly by `h5video.File`, which otherwise behaves like `h5py.File`. Raw recordings and `fs_disp/` files
+converted with `scripts/h5_to_video.py` use the same storage for colour, infrared and disparity.
+
+## Intermediate files of the processing steps
+
+Not read by training.
+
+**`fs_disp/disp_episode_<E>.hdf5`**: stereo disparity; packing turns it into the depth maps of the episode.
 
 | Path | Shape | Meaning |
 |---|---|---|
@@ -61,19 +74,13 @@ Datasets:
 | `disp_right/camera_C` | `T, H, W` | optional, right disparity for the left-right check |
 | `meta/camera_C/baseline` | `T` | metres |
 
-**`sam3_masks/episode_<E>_camera_<C>.h5`**: `frame_indices` (`N`) and `mask_union` (`N, full H, full W`). Object mask for the render loss, cropped with `crop`.
+**`sam3_masks/episode_<E>_camera_<C>.h5`**: `frame_indices` (`N`) and `mask_union` (`N, full H, full W`).
 
 **`gripper_supervision/masks_halo6_surface/episode_<E>.h5`**: `camera_C/gripper_mask` (`T, hw/8`), packed, with the same `crop` as `render/camera_C`.
 
-**`robot_label_cache/episode_<E>.h5`**: voxel labels at each decoder level. Attribute `bounds` is the 2 x 3 grid bounds and must match the task. `robot/<level>` and `gripper/<level>` hold packed `z, y, x` grids per frame, each with attribute `shape`.
+**`robot_label_cache/episode_<E>.h5`**: `robot/<level>` and `gripper/<level>` voxel labels, attribute `bounds`.
 
-**`tactile_targets/episode_<E>.npz`**: for tasks with tactile pads.
-
-| Key | Shape | Meaning |
-|---|---|---|
-| `xyz` | `T, 4, 384, 3` | taxel positions, 4 pads of 12 x 32 taxels |
-| `sig` | `T, 4, 384` | signal in 0 to 1 |
-| `has_tac` | scalar | false if the episode has no tactile data |
+**`tactile_targets/episode_<E>.npz`**: `xyz`, `sig`, `has_tac`.
 
 ## Latents: `episode_<E>_latents.h5`
 
