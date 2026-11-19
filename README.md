@@ -89,6 +89,18 @@ frame slider:
 
 Each prints its address; open `http://localhost:<port>`.
 
+## Deform360
+
+The Deform360 dynamics model draws the gripper into the voxel grid instead of using a plain action vector, and trains
+only on frames where the gripper is closed (the object does not move while it is open, so a model trained on all frames
+learns to copy the last frame). See the docstrings in [deform360/](deform360/).
+
+```bash
+python -m deform360.prepare --latents latents/train --raw <deform360 recordings> --out segments/train
+python -m deform360.prepare --latents latents/val   --raw <deform360 recordings> --out segments/val
+python -m deform360.train --latent-dir segments/train --val-latent-dir segments/val --out-dir runs/deform360/dynamics
+```
+
 ## More
 
 - [docs/guide.md](docs/guide.md): the full walkthrough, including processing your own recordings, rollout videos, demo controls, the kinematic robot arms and the Python API
